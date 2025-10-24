@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>MASt3R-SLAM Web Viewer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>MASt3R-SLAM Web Viewer</h1>
+    <nav>
+      <span id="status-indicator">Starting…</span>
+    </nav>
+  </header>
+  <main>
+    <section id="left-panel">
+      <div class="panel-heading">Current Frame</div>
+      <img id="current-image" alt="Current RGB frame" />
+      <div class="control">
+        <label for="conf-threshold">Confidence Threshold</label>
+        <input type="range" id="conf-threshold" min="0.0" max="5.0" step="0.1" value="1.5" />
+        <span id="conf-value">1.50</span>
+      </div>
+      <div id="frame-info"></div>
+    </section>
+    <section id="right-panel">
+      <canvas id="viewer"></canvas>
+    </section>
+  </main>
+  <footer>
+    <span>Shading derived from <code>resources/programs/surfelmap.glsl</code></span>
+  </footer>
+  <script src="app.js" defer></script>
+</body>
+</html>

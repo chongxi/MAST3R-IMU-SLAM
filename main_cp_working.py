@@ -22,7 +22,6 @@ from mast3r_slam.mast3r_utils import (
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
 from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg, run_visualization
-from mast3r_slam.web_visualization import run_web_visualization
 import torch.multiprocessing as mp
 
 
@@ -162,11 +161,6 @@ if __name__ == "__main__":
     parser.add_argument("--config", default="config/base.yaml")
     parser.add_argument("--save-as", default="default")
     parser.add_argument("--no-viz", action="store_true")
-    parser.add_argument("--web-viz", action="store_true", help="Start the browser-based visualization server.")
-    parser.add_argument("--web-viz-host", default="127.0.0.1", help="Host/IP for the web viewer.")
-    parser.add_argument("--web-viz-port", type=int, default=7860, help="Port for the web viewer.")
-    parser.add_argument("--web-viz-stride", type=int, default=2, help="Pixel stride for current frame surfels.")
-    parser.add_argument("--web-viz-keyframe-stride", type=int, default=4, help="Pixel stride for keyframe surfels.")
     parser.add_argument("--calib", default="")
     parser.add_argument("--fp8", action="store_true", help="Enable FP8 acceleration (4x speedup on Thor GPU)")
 
@@ -205,21 +199,6 @@ if __name__ == "__main__":
             args=(config, states, keyframes, main2viz, viz2main),
         )
         viz.start()
-
-    web_viz = None
-    if args.web_viz:
-        web_viz = mp.Process(
-            target=run_web_visualization,
-            args=(config, states, keyframes, main2viz, viz2main),
-            kwargs={
-                "host": args.web_viz_host,
-                "port": args.web_viz_port,
-                "conf_threshold": WindowMsg().C_conf_threshold,
-                "current_stride": max(1, args.web_viz_stride),
-                "keyframe_stride": max(1, args.web_viz_keyframe_stride),
-            },
-        )
-        web_viz.start()
 
     model = load_mast3r(device=device, use_fp8=args.fp8)
     model.share_memory()
@@ -363,5 +342,3 @@ if __name__ == "__main__":
     backend.join()
     if not args.no_viz:
         viz.join()
-    if args.web_viz and web_viz is not None:
-        web_viz.join()

@@ -3,17 +3,19 @@ import datetime
 import pathlib
 import sys
 import time
+
 import cv2
 import lietorch
 import torch
 import tqdm
 import yaml
-from mast3r_slam.global_opt import FactorGraph
+import torch.multiprocessing as mp
 
 from mast3r_slam.config import load_config, config, set_global_config
 from mast3r_slam.dataloader import Intrinsics, load_dataset
 import mast3r_slam.evaluate as eval
 from mast3r_slam.frame import Mode, SharedKeyframes, SharedStates, create_frame
+from mast3r_slam.global_opt import FactorGraph
 from mast3r_slam.mast3r_utils import (
     load_mast3r,
     load_retriever,
@@ -21,14 +23,11 @@ from mast3r_slam.mast3r_utils import (
 )
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
 from mast3r_slam.tracker import FrameTracker
-from mast3r_slam.visualization import WindowMsg, run_visualization
+from mast3r_slam.visualization import WindowMsg
 from mast3r_slam.web_visualization import run_web_visualization
-import torch.multiprocessing as mp
 
 
 def relocalization(frame, keyframes, factor_graph, retrieval_database):
-    # we are adding and then removing from the keyframe, so we need to be careful.
-    # The lock slows viz down but safer this way...
     with keyframes.lock:
         kf_idx = []
         retrieval_inds = retrieval_database.update(
@@ -42,7 +41,7 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
         if kf_idx:
             keyframes.append(frame)
             n_kf = len(keyframes)
-            kf_idx = list(kf_idx)  # convert to list
+            kf_idx = list(kf_idx)
             frame_idx = [n_kf - 1] * len(kf_idx)
             print("RELOCALIZING against kf ", n_kf - 1, " and ", kf_idx)
             if factor_graph.add_factors(
@@ -74,10 +73,10 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
 
 def run_backend(cfg, model, states, keyframes, K, use_fp8=False):
     set_global_config(cfg)
-    
-    # Set FP8 flag in backend process
+
     if use_fp8:
         import mast3r_slam.mast3r_utils as mutils
+
         mutils.USE_FP8 = True
 
     device = keyframes.device
@@ -105,9 +104,7 @@ def run_backend(cfg, model, states, keyframes, K, use_fp8=False):
             time.sleep(0.01)
             continue
 
-        # Graph Construction
         kf_idx = []
-        # k to previous consecutive keyframes
         n_consec = 1
         for j in range(min(n_consec, idx)):
             kf_idx.append(idx - 1 - j)
@@ -125,9 +122,9 @@ def run_backend(cfg, model, states, keyframes, K, use_fp8=False):
         if len(lc_inds) > 0:
             print("Database retrieval", idx, ": ", lc_inds)
 
-        kf_idx = set(kf_idx)  # Remove duplicates by using set
-        kf_idx.discard(idx)  # Remove current kf idx if included
-        kf_idx = list(kf_idx)  # convert to list
+        kf_idx = set(kf_idx)
+        kf_idx.discard(idx)
+        kf_idx = list(kf_idx)
         frame_idx = [idx] * len(kf_idx)
         if kf_idx:
             factor_graph.add_factors(
@@ -151,7 +148,7 @@ def run_backend(cfg, model, states, keyframes, K, use_fp8=False):
 if __name__ == "__main__":
     mp.set_start_method("spawn")
     torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True 
+    torch.backends.cudnn.benchmark = True
     torch.set_grad_enabled(False)
     device = "cuda:0"
     save_frames = False
@@ -161,14 +158,18 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default="datasets/tum/rgbd_dataset_freiburg1_desk")
     parser.add_argument("--config", default="config/base.yaml")
     parser.add_argument("--save-as", default="default")
-    parser.add_argument("--no-viz", action="store_true")
-    parser.add_argument("--web-viz", action="store_true", help="Start the browser-based visualization server.")
-    parser.add_argument("--web-viz-host", default="127.0.0.1", help="Host/IP for the web viewer.")
-    parser.add_argument("--web-viz-port", type=int, default=7860, help="Port for the web viewer.")
-    parser.add_argument("--web-viz-stride", type=int, default=2, help="Pixel stride for current frame surfels.")
-    parser.add_argument("--web-viz-keyframe-stride", type=int, default=4, help="Pixel stride for keyframe surfels.")
     parser.add_argument("--calib", default="")
     parser.add_argument("--fp8", action="store_true", help="Enable FP8 acceleration (4x speedup on Thor GPU)")
+    parser.add_argument("--no-web", action="store_true", help="Disable the web visualization.")
+    parser.add_argument("--web-host", default="127.0.0.1", help="Host/IP for the web viewer server.")
+    parser.add_argument("--web-port", type=int, default=7860, help="Port for the web viewer server.")
+    parser.add_argument("--web-stride", type=int, default=2, help="Pixel stride for the current frame surfels.")
+    parser.add_argument(
+        "--web-keyframe-stride",
+        type=int,
+        default=8,
+        help="Pixel stride for keyframe surfels.",
+    )
 
     args = parser.parse_args()
 
@@ -177,8 +178,8 @@ if __name__ == "__main__":
     print(config)
 
     manager = mp.Manager()
-    main2viz = new_queue(manager, args.no_viz)
-    viz2main = new_queue(manager, args.no_viz)
+    main2viz = new_queue(manager, args.no_web)
+    viz2main = new_queue(manager, args.no_web)
 
     dataset = load_dataset(args.dataset)
     dataset.subsample(config["dataset"]["subsample"])
@@ -199,32 +200,23 @@ if __name__ == "__main__":
     keyframes = SharedKeyframes(manager, h, w)
     states = SharedStates(manager, h, w)
 
-    if not args.no_viz:
-        viz = mp.Process(
-            target=run_visualization,
-            args=(config, states, keyframes, main2viz, viz2main),
-        )
-        viz.start()
-
     web_viz = None
-    if args.web_viz:
+    if not args.no_web:
         web_viz = mp.Process(
             target=run_web_visualization,
             args=(config, states, keyframes, main2viz, viz2main),
             kwargs={
-                "host": args.web_viz_host,
-                "port": args.web_viz_port,
+                "host": args.web_host,
+                "port": args.web_port,
                 "conf_threshold": WindowMsg().C_conf_threshold,
-                "current_stride": max(1, args.web_viz_stride),
-                "keyframe_stride": max(1, args.web_viz_keyframe_stride),
+                "current_stride": args.web_stride,
+                "keyframe_stride": args.web_keyframe_stride,
             },
         )
         web_viz.start()
 
     model = load_mast3r(device=device, use_fp8=args.fp8)
     model.share_memory()
-    # model.compile()
-    # model.eval()
 
     has_calib = dataset.has_calib()
     use_calib = config["use_calib"]
@@ -239,7 +231,6 @@ if __name__ == "__main__":
         )
         keyframes.set_intrinsics(K)
 
-    # remove the trajectory from the previous run
     if dataset.save_results:
         save_dir, seq_name = eval.prepare_savedir(args, dataset)
         traj_file = save_dir / f"{seq_name}.txt"
@@ -257,7 +248,6 @@ if __name__ == "__main__":
 
     i = 0
     fps_timer = time.time()
-
     frames = []
 
     while True:
@@ -284,16 +274,21 @@ if __name__ == "__main__":
         if save_frames:
             frames.append(img)
 
-        # get frames last camera pose
         T_WC = (
             lietorch.Sim3.Identity(1, device=device)
             if i == 0
             else states.get_frame().T_WC
         )
-        frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device, use_fp16=args.fp8)
+        frame = create_frame(
+            i,
+            img,
+            T_WC,
+            img_size=dataset.img_size,
+            device=device,
+            use_fp16=args.fp8,
+        )
 
         if mode == Mode.INIT:
-            # Initialize via mono inference, and encoded features neeed for database
             X_init, C_init = mast3r_inference_mono(model, frame)
             frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
@@ -314,7 +309,6 @@ if __name__ == "__main__":
             frame.update_pointmap(X, C)
             states.set_frame(frame)
             states.queue_reloc()
-            # In single threaded mode, make sure relocalization happen for every frame
             while config["single_thread"]:
                 with states.lock:
                     if states.reloc_sem.value == 0:
@@ -327,14 +321,13 @@ if __name__ == "__main__":
         if add_new_kf:
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1)
-            # In single threaded mode, wait for the backend to finish
             while config["single_thread"]:
                 with states.lock:
                     if len(states.global_optimizer_tasks) == 0:
                         break
                 time.sleep(0.01)
-        # log time
-        if i % 30 == 0:
+
+        if i % 30 == 0 and i > 0:
             FPS = i / (time.time() - fps_timer)
             print(f"FPS: {FPS}")
         i += 1
@@ -361,7 +354,5 @@ if __name__ == "__main__":
 
     print("done")
     backend.join()
-    if not args.no_viz:
-        viz.join()
-    if args.web_viz and web_viz is not None:
+    if web_viz is not None:
         web_viz.join()
