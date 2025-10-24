@@ -205,8 +205,8 @@ class FrameTracker:
                 break
             old_cost = new_cost
 
-            if step == self.cfg["max_iters"] - 1:
-                print(f"max iters reached {last_error}")
+            # if step == self.cfg["max_iters"] - 1:
+            #     print(f"max iters reached {last_error}")
 
         # Assign new pose based on relative pose
         T_WCf = T_WCk * T_CkCf
@@ -257,8 +257,8 @@ class FrameTracker:
                 break
             old_cost = new_cost
 
-            if step == self.cfg["max_iters"] - 1:
-                print(f"max iters reached {last_error}")
+            # if step == self.cfg["max_iters"] - 1:
+            #     print(f"max iters reached {last_error}")
 
         # Assign new pose based on relative pose
         T_WCf = T_WCk * T_CkCf
