@@ -108,9 +108,24 @@ class Frame:
         return self.C / self.N if self.C is not None else None
 
 
-def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
+def create_frame(i, img, T_WC, img_size=512, device="cuda:0", use_fp16=False):
+    """Create a frame from an image.
+    
+    Args:
+        i: Frame index
+        img: Input image (numpy array)
+        T_WC: Camera pose
+        img_size: Target image size for resizing
+        device: Device to place tensors on
+        use_fp16: If True, convert image tensor to FP16
+    """
     img = resize_img(img, img_size)
     rgb = img["img"].to(device=device)
+    
+    # Convert to FP16 if requested (for FP8 acceleration)
+    if use_fp16:
+        rgb = rgb.half()
+    
     img_shape = torch.tensor(img["true_shape"], device=device)
     img_true_shape = img_shape.clone()
     uimg = torch.from_numpy(img["unnormalized_img"]) / 255.0

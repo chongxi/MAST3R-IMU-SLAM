@@ -71,8 +71,13 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
         return successful_loop_closure
 
 
-def run_backend(cfg, model, states, keyframes, K):
+def run_backend(cfg, model, states, keyframes, K, use_fp8=False):
     set_global_config(cfg)
+    
+    # Set FP8 flag in backend process
+    if use_fp8:
+        import mast3r_slam.mast3r_utils as mutils
+        mutils.USE_FP8 = True
 
     device = keyframes.device
     factor_graph = FactorGraph(model, keyframes, K, device)
@@ -145,6 +150,7 @@ def run_backend(cfg, model, states, keyframes, K):
 if __name__ == "__main__":
     mp.set_start_method("spawn")
     torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True 
     torch.set_grad_enabled(False)
     device = "cuda:0"
     save_frames = False
@@ -156,6 +162,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-as", default="default")
     parser.add_argument("--no-viz", action="store_true")
     parser.add_argument("--calib", default="")
+    parser.add_argument("--fp8", action="store_true", help="Enable FP8 acceleration (4x speedup on Thor GPU)")
 
     args = parser.parse_args()
 
@@ -193,8 +200,10 @@ if __name__ == "__main__":
         )
         viz.start()
 
-    model = load_mast3r(device=device)
+    model = load_mast3r(device=device, use_fp8=args.fp8)
     model.share_memory()
+    # model.compile()
+    # model.eval()
 
     has_calib = dataset.has_calib()
     use_calib = config["use_calib"]
@@ -222,7 +231,7 @@ if __name__ == "__main__":
     tracker = FrameTracker(model, keyframes, device)
     last_msg = WindowMsg()
 
-    backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K))
+    backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K, args.fp8))
     backend.start()
 
     i = 0
@@ -260,7 +269,7 @@ if __name__ == "__main__":
             if i == 0
             else states.get_frame().T_WC
         )
-        frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
+        frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device, use_fp16=args.fp8)
 
         if mode == Mode.INIT:
             # Initialize via mono inference, and encoded features neeed for database

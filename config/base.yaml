@@ -1,7 +1,7 @@
 use_calib: False
 single_thread: False
 dataset:
-  subsample: 10
+  subsample: 5
   img_downsample: 1
   center_principle_point: True
 
@@ -15,7 +15,7 @@ matching:
 
 tracking:
   min_match_frac: 0.05
-  max_iters: 50
+  max_iters: 1 # previous 50
   C_conf: 0.0
   Q_conf: 1.5
   rel_error: 1e-3

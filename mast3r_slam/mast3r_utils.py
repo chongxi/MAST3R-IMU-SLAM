@@ -10,14 +10,57 @@ from mast3r_slam.retrieval_database import RetrievalDatabase
 from mast3r_slam.config import config
 import mast3r_slam.matching as matching
 
+# FP8 optimization support
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.common import recipe
+    FP8_AVAILABLE = True
+    fp8_recipe = te.fp8.DelayedScaling(margin=0, fp8_format=recipe.Format.E4M3)
+except ImportError:
+    FP8_AVAILABLE = False
+    print("[Warning] Transformer Engine not available, FP8 acceleration disabled")
 
-def load_mast3r(path=None, device="cuda"):
-    weights_path = (
-        "checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
-        if path is None
-        else path
-    )
+# Global flag to control FP8 usage
+USE_FP8 = False
+
+
+def get_use_fp8():
+    """Check if FP8 is currently enabled"""
+    return USE_FP8
+
+
+def load_mast3r(path=None, device="cuda", use_fp8=False):
+    """Load MASt3R model with optional FP8 optimization.
+    
+    Args:
+        path: Path to model checkpoint
+        device: Device to load model on
+        use_fp8: If True, convert model to FP16 for FP8 acceleration
+        
+    Returns:
+        model: Loaded MASt3R model (in FP16 if use_fp8=True)
+    """
+    global USE_FP8
+    
+    if path is None:
+        # Find checkpoint relative to this file's location
+        import os
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.dirname(current_dir)
+        weights_path = os.path.join(repo_root, "checkpoints", "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth")
+    else:
+        weights_path = path
+    
     model = AsymmetricMASt3R.from_pretrained(weights_path).to(device)
+    
+    if use_fp8:
+        if not FP8_AVAILABLE:
+            print("[Warning] FP8 requested but Transformer Engine not available, using FP32")
+        else:
+            print("[FP8] Converting model to FP16 for FP8 acceleration")
+            model = model.half()
+            USE_FP8 = True
+    
     return model
 
 
@@ -33,10 +76,22 @@ def load_retriever(mast3r_model, retriever_path=None, device="cuda"):
 
 @torch.inference_mode
 def decoder(model, feat1, feat2, pos1, pos2, shape1, shape2):
-    dec1, dec2 = model._decoder(feat1, pos1, feat2, pos2)
+    if USE_FP8 and FP8_AVAILABLE:
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            dec1, dec2 = model._decoder(feat1, pos1, feat2, pos2)
+    else:
+        dec1, dec2 = model._decoder(feat1, pos1, feat2, pos2)
+    
+    # Keep in FP16 if model is in FP16, otherwise convert to float
     with torch.amp.autocast(enabled=False, device_type="cuda"):
-        res1 = model._downstream_head(1, [tok.float() for tok in dec1], shape1)
-        res2 = model._downstream_head(2, [tok.float() for tok in dec2], shape2)
+        if USE_FP8:
+            # Keep decoder outputs in FP16 for FP16 model
+            res1 = model._downstream_head(1, dec1, shape1)
+            res2 = model._downstream_head(2, dec2, shape2)
+        else:
+            # Convert to float for FP32 model
+            res1 = model._downstream_head(1, [tok.float() for tok in dec1], shape1)
+            res2 = model._downstream_head(2, [tok.float() for tok in dec2], shape2)
     return res1, res2
 
 
@@ -55,16 +110,35 @@ def downsample(X, C, D, Q):
 @torch.inference_mode
 def mast3r_symmetric_inference(model, frame_i, frame_j):
     if frame_i.feat is None:
-        frame_i.feat, frame_i.pos, _ = model._encode_image(
-            frame_i.img, frame_i.img_true_shape
-        )
+        if USE_FP8 and FP8_AVAILABLE:
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                frame_i.feat, frame_i.pos, _ = model._encode_image(
+                    frame_i.img, frame_i.img_true_shape
+                )
+        else:
+            frame_i.feat, frame_i.pos, _ = model._encode_image(
+                frame_i.img, frame_i.img_true_shape
+            )
     if frame_j.feat is None:
-        frame_j.feat, frame_j.pos, _ = model._encode_image(
-            frame_j.img, frame_j.img_true_shape
-        )
+        if USE_FP8 and FP8_AVAILABLE:
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                frame_j.feat, frame_j.pos, _ = model._encode_image(
+                    frame_j.img, frame_j.img_true_shape
+                )
+        else:
+            frame_j.feat, frame_j.pos, _ = model._encode_image(
+                frame_j.img, frame_j.img_true_shape
+            )
 
     feat1, feat2 = frame_i.feat, frame_j.feat
     pos1, pos2 = frame_i.pos, frame_j.pos
+    
+    # Ensure features match model dtype (FP16 if using FP8)
+    if USE_FP8 and feat1.dtype != torch.float16:
+        feat1 = feat1.half()
+    if USE_FP8 and feat2.dtype != torch.float16:
+        feat2 = feat2.half()
+    
     shape1, shape2 = frame_i.img_true_shape, frame_j.img_true_shape
 
     res11, res21 = decoder(model, feat1, feat2, pos1, pos2, shape1, shape2)
@@ -75,6 +149,14 @@ def mast3r_symmetric_inference(model, frame_i, frame_j):
     )
     # 4xhxwxc
     X, C, D, Q = torch.stack(X), torch.stack(C), torch.stack(D), torch.stack(Q)
+    
+    # Convert back to FP32 for SLAM backend compatibility (async for better performance)
+    if USE_FP8:
+        X = X.to(dtype=torch.float32, non_blocking=True)
+        C = C.to(dtype=torch.float32, non_blocking=True)
+        D = D.to(dtype=torch.float32, non_blocking=True)
+        Q = Q.to(dtype=torch.float32, non_blocking=True)
+    
     X, C, D, Q = downsample(X, C, D, Q)
     return X, C, D, Q
 
@@ -85,10 +167,18 @@ def mast3r_decode_symmetric_batch(
     model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
 ):
     B = feat_i.shape[0]
+    
     X, C, D, Q = [], [], [], []
     for b in range(B):
         feat1 = feat_i[b][None]
         feat2 = feat_j[b][None]
+        
+        # Ensure features match model dtype (FP16 if using FP8)
+        if USE_FP8 and feat1.dtype != torch.float16:
+            feat1 = feat1.half()
+        if USE_FP8 and feat2.dtype != torch.float16:
+            feat2 = feat2.half()
+        
         pos1 = pos_i[b][None]
         pos2 = pos_j[b][None]
         res11, res21 = decoder(model, feat1, feat2, pos1, pos2, shape_i[b], shape_j[b])
@@ -111,6 +201,14 @@ def mast3r_decode_symmetric_batch(
         torch.stack(D, dim=1),
         torch.stack(Q, dim=1),
     )
+    
+    # Convert back to FP32 for SLAM backend compatibility (async for better performance)
+    if USE_FP8:
+        X = X.to(dtype=torch.float32, non_blocking=True)
+        C = C.to(dtype=torch.float32, non_blocking=True)
+        D = D.to(dtype=torch.float32, non_blocking=True)
+        Q = Q.to(dtype=torch.float32, non_blocking=True)
+    
     X, C, D, Q = downsample(X, C, D, Q)
     return X, C, D, Q
 
@@ -118,9 +216,17 @@ def mast3r_decode_symmetric_batch(
 @torch.inference_mode
 def mast3r_inference_mono(model, frame):
     if frame.feat is None:
-        frame.feat, frame.pos, _ = model._encode_image(frame.img, frame.img_true_shape)
+        if USE_FP8 and FP8_AVAILABLE:
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                frame.feat, frame.pos, _ = model._encode_image(frame.img, frame.img_true_shape)
+        else:
+            frame.feat, frame.pos, _ = model._encode_image(frame.img, frame.img_true_shape)
 
     feat = frame.feat
+    # Ensure features match model dtype (FP16 if using FP8)
+    if USE_FP8 and feat.dtype != torch.float16:
+        feat = feat.half()
+    
     pos = frame.pos
     shape = frame.img_true_shape
 
@@ -131,6 +237,14 @@ def mast3r_inference_mono(model, frame):
     )
     # 4xhxwxc
     X, C, D, Q = torch.stack(X), torch.stack(C), torch.stack(D), torch.stack(Q)
+    
+    # Convert back to FP32 for SLAM backend compatibility (async for better performance)
+    if USE_FP8:
+        X = X.to(dtype=torch.float32, non_blocking=True)
+        C = C.to(dtype=torch.float32, non_blocking=True)
+        D = D.to(dtype=torch.float32, non_blocking=True)
+        Q = Q.to(dtype=torch.float32, non_blocking=True)
+    
     X, C, D, Q = downsample(X, C, D, Q)
 
     Xii, Xji = einops.rearrange(X, "b h w c -> b (h w) c")
@@ -183,15 +297,34 @@ def mast3r_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
 @torch.inference_mode
 def mast3r_asymmetric_inference(model, frame_i, frame_j):
     if frame_i.feat is None:
-        frame_i.feat, frame_i.pos, _ = model._encode_image(
-            frame_i.img, frame_i.img_true_shape
-        )
+        if USE_FP8 and FP8_AVAILABLE:
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                frame_i.feat, frame_i.pos, _ = model._encode_image(
+                    frame_i.img, frame_i.img_true_shape
+                )
+        else:
+            frame_i.feat, frame_i.pos, _ = model._encode_image(
+                frame_i.img, frame_i.img_true_shape
+            )
     if frame_j.feat is None:
-        frame_j.feat, frame_j.pos, _ = model._encode_image(
-            frame_j.img, frame_j.img_true_shape
-        )
-
+        if USE_FP8 and FP8_AVAILABLE:
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                frame_j.feat, frame_j.pos, _ = model._encode_image(
+                    frame_j.img, frame_j.img_true_shape
+                )
+        else:
+            frame_j.feat, frame_j.pos, _ = model._encode_image(
+                frame_j.img, frame_j.img_true_shape
+            )
+    
     feat1, feat2 = frame_i.feat, frame_j.feat
+    
+    # Ensure features match model dtype (FP16 if using FP8)
+    if USE_FP8 and feat1.dtype != torch.float16:
+        feat1 = feat1.half()
+    if USE_FP8 and feat2.dtype != torch.float16:
+        feat2 = feat2.half()
+    
     pos1, pos2 = frame_i.pos, frame_j.pos
     shape1, shape2 = frame_i.img_true_shape, frame_j.img_true_shape
 
@@ -202,6 +335,14 @@ def mast3r_asymmetric_inference(model, frame_i, frame_j):
     )
     # 4xhxwxc
     X, C, D, Q = torch.stack(X), torch.stack(C), torch.stack(D), torch.stack(Q)
+    
+    # Convert back to FP32 for SLAM backend compatibility (async for better performance)
+    if USE_FP8:
+        X = X.to(dtype=torch.float32, non_blocking=True)
+        C = C.to(dtype=torch.float32, non_blocking=True)
+        D = D.to(dtype=torch.float32, non_blocking=True)
+        Q = Q.to(dtype=torch.float32, non_blocking=True)
+    
     X, C, D, Q = downsample(X, C, D, Q)
     return X, C, D, Q
 

@@ -87,6 +87,22 @@ Our system can process either MP4 videos or folders containing RGB images.
 ```
 python main.py --dataset <path/to/video>.mp4 --config config/base.yaml
 python main.py --dataset <path/to/folder> --config config/base.yaml
+
+## ONNX Workflow
+1. Export the MASt3R checkpoint once (requires torch>=2.4 and transformer_engine>=1.10). The default export uses FP16 weights and activations, matching the runtime pipeline:
+   ```
+   python scripts/export_mast3r_onnx.py --checkpoint checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth
+   ```
+   Add `--precision fp32` if you prefer a full-precision graph.
+2. Install an ONNX Runtime backend (CUDA recommended):
+   ```
+   pip install onnxruntime-gpu onnxscript
+   ```
+3. Run the SLAM pipeline with the exported model (optional `--onnx-model` overrides the default path under `onnx/`):
+   ```
+   python main_onnx.py --dataset <path/to/folder> --config config/base.yaml
+   ```
+
 ```
 If the calibration parameters are known, you can specify them in intrinsics.yaml
 ```
