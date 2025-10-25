@@ -24,7 +24,7 @@ from mast3r_slam.mast3r_utils import (
     mast3r_inference_mono,
 )
 from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
-from mast3r_slam.lietorch_utils import yaw_from_sim3
+from mast3r_slam.lietorch_utils import as_SE3, yaw_from_sim3
 from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg
 from mast3r_slam.web_visualization import run_web_visualization
@@ -346,8 +346,14 @@ if __name__ == "__main__":
     parser.add_argument("--imu_dev", default="", help="Serial device for IMU data (e.g. /dev/ttyACM0).")
     parser.add_argument("--imu_baud", type=int, default=115200, help="IMU serial baud rate.")
     parser.add_argument("--anchor_dir", default="", help="Optional directory of anchor images to seed into the retriever.")
+    parser.add_argument(
+        "--save-camera-results",
+        action="store_true",
+        help="Save trajectory, point cloud, and keyframes when running with --camera.",
+    )
 
     args = parser.parse_args()
+    save_camera_results = args.save_camera_results or args.save_as != "default"
 
     load_config(args.config)
     print(args.dataset)
@@ -488,8 +494,29 @@ if __name__ == "__main__":
             )
             imu_process.start()
 
+        keyframe_save_dir = None
+        pose_log_file = None
+        pose_log_path = None
+        seq_name = None
+        if save_camera_results:
+            log_root = pathlib.Path("logs")
+            if args.save_as != "default":
+                log_root = log_root / args.save_as
+                seq_name = args.save_as
+            else:
+                seq_name = f"camera_{datetime_now}"
+            seq_name = seq_name.replace(":", "-")
+            keyframe_save_dir = log_root / "keyframes" / seq_name
+            keyframe_save_dir.mkdir(parents=True, exist_ok=True)
+            pose_log_path = log_root / f"{seq_name}_poses.txt"
+            pose_log_file = pose_log_path.open("w", encoding="utf-8")
+            pose_log_file.write("frame_id,time_sec,x,y,yaw_deg\n")
+            pose_log_file.flush()
+            print(f"[Save] Keyframes will be written to {keyframe_save_dir}")
+
         processed_idx = 0
-        fps_timer = time.time()
+        camera_start_time = time.time()
+        fps_timer = camera_start_time
 
         try:
             while True:
@@ -580,6 +607,29 @@ if __name__ == "__main__":
 
                 if add_new_kf:
                     keyframes.append(frame)
+                    if save_camera_results and keyframe_save_dir is not None:
+                        elapsed = time.time() - camera_start_time
+                        img_np = (frame_np * 255.0).clip(0, 255).astype(
+                            np.uint8
+                        )
+                        img_np = cv2.resize(img_np, (512, 512), interpolation=cv2.INTER_AREA)
+                        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                        img_path = keyframe_save_dir / f"{frame.frame_id:06d}.png"
+                        cv2.imwrite(str(img_path), img_bgr)
+                        yaw_rad = yaw_from_sim3(frame.T_WC)
+                        yaw_deg = math.degrees(yaw_rad)
+                        pose_se3 = as_SE3(frame.T_WC)
+                        pose_mat = pose_se3.matrix()
+                        if pose_mat.ndim == 3:
+                            pose_mat = pose_mat[0]
+                        pose_mat = pose_mat.detach().cpu()
+                        x = float(pose_mat[0, 3])
+                        y = float(pose_mat[1, 3])
+                        if pose_log_file is not None:
+                            pose_log_file.write(
+                                f"{frame.frame_id},{elapsed:.4f},{x:.6f},{y:.6f},{yaw_deg:.3f}\n"
+                            )
+                            pose_log_file.flush()
                     states.queue_global_optimization(len(keyframes) - 1)
                     while config["single_thread"]:
                         with states.lock:
@@ -602,6 +652,10 @@ if __name__ == "__main__":
             imu_stop.set()
             if imu_process is not None and imu_process.is_alive():
                 imu_process.join(timeout=2.0)
+
+        if pose_log_file is not None:
+            pose_log_file.close()
+            print(f"[Save] Pose log written to {pose_log_path}")
 
         print("done")
         backend.join()
