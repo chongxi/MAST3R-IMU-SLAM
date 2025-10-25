@@ -161,6 +161,14 @@
     return out;
   }
 
+  function flipZ(buffer, stride = 3) {
+    for (let i = stride - 1; i < buffer.length; i += stride) {
+      buffer[i] = -buffer[i];
+    }
+    return buffer;
+  }
+
+
   // ---------------------------------------------------------------------------
   // Shader compilation helpers
   // ---------------------------------------------------------------------------
@@ -365,8 +373,8 @@
     currentAxisCounts.x = 0;
     currentAxisCounts.y = 0;
     currentAxisCounts.z = 0;
-    const empty = new Float32Array(0);
     const axisKeys = ['x', 'y', 'z'];
+    const empty = new Float32Array(0);
     const bindEmpty = () => {
       axisKeys.forEach((key) => {
         gl.bindBuffer(gl.ARRAY_BUFFER, currentAxisVAOs[key].buffer);
@@ -383,6 +391,7 @@
       bindEmpty();
       return;
     }
+
     const origin = [pose[0][3] || 0, pose[1][3] || 0, pose[2][3] || 0];
     const axes = [
       [pose[0][0], pose[1][0], pose[2][0]],
@@ -407,11 +416,13 @@
         origin[0], origin[1], origin[2],
         end[0], end[1], end[2],
       ]);
+      flipZ(data);
       gl.bindBuffer(gl.ARRAY_BUFFER, currentAxisVAOs[key].buffer);
       gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
       currentAxisCounts[key] = data.length / 3;
     });
   }
+
 
   function updateSurfels(scene) {
     if (!scene || !Array.isArray(scene.points) || scene.points.length === 0) {
@@ -422,6 +433,8 @@
     const positions = new Float32Array(scene.points);
     const normals = new Float32Array(scene.normals);
     const colors = new Float32Array(scene.colors);
+    flipZ(positions);
+    flipZ(normals);
     surfelCount = positions.length / 3;
 
     gl.bindBuffer(gl.ARRAY_BUFFER, surfelVAO.positionBuffer);
@@ -501,6 +514,9 @@
       }
     }
 
+    flipZ(positions);
+    flipZ(normals);
+
     gl.bindBuffer(gl.ARRAY_BUFFER, keyframeVAO.positionBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, keyframeVAO.normalBuffer);
@@ -511,6 +527,7 @@
 
     axisKeys.forEach((key) => {
       const data = new Float32Array(axisData[key]);
+      flipZ(data);
       gl.bindBuffer(gl.ARRAY_BUFFER, keyframeAxisVAOs[key].buffer);
       gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
       keyframeAxisCounts[key] = data.length / 3;
@@ -525,6 +542,7 @@
         trajPositions.set(a, base);
         trajPositions.set(b, base + 3);
       }
+      flipZ(trajPositions);
       gl.bindBuffer(gl.ARRAY_BUFFER, trajectoryVAO.buffer);
       gl.bufferData(gl.ARRAY_BUFFER, trajPositions, gl.DYNAMIC_DRAW);
       trajectoryVertexCount = trajPositions.length / 3;
@@ -545,6 +563,7 @@
       positions.set(segment[0], base);
       positions.set(segment[1], base + 3);
     }
+    flipZ(positions);
     gl.bindBuffer(gl.ARRAY_BUFFER, edgeVAO.buffer);
     gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
     edgeVertexCount = positions.length / 3;
@@ -598,7 +617,7 @@
       const pos = state.currentFrame.position || [0, 0, 0];
       desiredTarget[0] = pos[0];
       desiredTarget[1] = pos[1];
-      desiredTarget[2] = pos[2];
+      desiredTarget[2] = -pos[2];
     }
 
     updateSurfels(state.scene);

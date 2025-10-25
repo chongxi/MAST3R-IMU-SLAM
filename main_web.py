@@ -208,7 +208,7 @@ if __name__ == "__main__":
             kwargs={
                 "host": args.web_host,
                 "port": args.web_port,
-                "conf_threshold": WindowMsg().C_conf_threshold,
+                "conf_threshold": config["tracking"]["C_conf"],
                 "current_stride": args.web_stride,
                 "keyframe_stride": args.web_keyframe_stride,
             },
