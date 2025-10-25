@@ -1,7 +1,7 @@
 use_calib: False
 single_thread: False
 dataset:
-  subsample: 5
+  subsample: 8
   img_downsample: 1
   center_principle_point: True
 
@@ -31,6 +31,11 @@ tracking:
   depth_eps: 1e-6 # Only in calib case
   filtering_mode: weighted_pointmap # recent, first, best_score, weighted_pointmap, weighted_spherical, indep_conf
   filtering_score: median # median, mean (only used for filtering_mode=best_score)
+  global_opt_stride: 2
+  max_keyframes: 1000
+
+imu:
+  yaw_sign: -1.0
 
 local_opt:
   pin: 1

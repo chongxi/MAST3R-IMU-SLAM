@@ -191,7 +191,7 @@ def seed_anchor_frames(anchor_dir, model, keyframes, states, *, img_size, device
     return loaded
 
 
-def imu_reader_process(device: str, baudrate: int, states, stop_event):
+def imu_reader_process(device: str, baudrate: int, states, stop_event, yaw_sign: float = 1.0):
     """Background worker that streams yaw readings from a serial IMU."""
     import math
     import time
@@ -217,7 +217,7 @@ def imu_reader_process(device: str, baudrate: int, states, stop_event):
             packet = parse_imu_packet(line)
             if packet is None:
                 continue
-            yaw_deg = packet["yaw"]
+            yaw_deg = packet["yaw"] * yaw_sign
             yaw_rad = math.radians(yaw_deg)
             states.set_imu_yaw(yaw_rad)
             now = time.time()
@@ -367,6 +367,11 @@ if __name__ == "__main__":
     cap = None
     camera_intrinsics = None
     dataset = None
+    global_opt_stride = max(
+        1, int(config.get("tracking", {}).get("global_opt_stride", 1))
+    )
+    max_keyframes_cfg = int(config.get("tracking", {}).get("max_keyframes", 512))
+    imu_yaw_sign = float(config.get("imu", {}).get("yaw_sign", 1.0))
 
     if use_camera:
         if config["use_calib"] and not args.calib:
@@ -406,7 +411,7 @@ if __name__ == "__main__":
             use_fp16=args.fp8,
         )
         h, w = temp_frame.img.shape[-2:]
-        keyframes = SharedKeyframes(manager, h, w)
+        keyframes = SharedKeyframes(manager, h, w, buffer=max_keyframes_cfg)
         states = SharedStates(manager, h, w)
         if config["use_calib"] and camera_intrinsics is not None:
             K = torch.from_numpy(camera_intrinsics.K_frame).to(
@@ -431,7 +436,7 @@ if __name__ == "__main__":
                 intrinsics["height"],
                 intrinsics["calibration"],
             )
-        keyframes = SharedKeyframes(manager, h, w)
+        keyframes = SharedKeyframes(manager, h, w, buffer=max_keyframes_cfg)
         states = SharedStates(manager, h, w)
         has_calib = dataset.has_calib()
         use_calib = config["use_calib"]
@@ -489,7 +494,7 @@ if __name__ == "__main__":
             imu_stop = mp.Event()
             imu_process = mp.Process(
                 target=imu_reader_process,
-                args=(args.imu_dev, args.imu_baud, states, imu_stop),
+                args=(args.imu_dev, args.imu_baud, states, imu_stop, imu_yaw_sign),
                 daemon=True,
             )
             imu_process.start()
@@ -514,7 +519,12 @@ if __name__ == "__main__":
             pose_log_file.flush()
             print(f"[Save] Keyframes will be written to {keyframe_save_dir}")
 
+        max_keyframes = keyframes.buffer
+        keyframe_limit_warned = False
+
         processed_idx = 0
+        capture_idx = 0
+        frame_skip = max(1, int(config.get("dataset", {}).get("subsample", 1)))
         camera_start_time = time.time()
         fps_timer = camera_start_time
 
@@ -541,6 +551,10 @@ if __name__ == "__main__":
                     time.sleep(0.05)
                     continue
 
+                capture_idx += 1
+                if frame_skip > 1 and (capture_idx - 1) % frame_skip != 0:
+                    continue
+
                 T_WC = (
                     lietorch.Sim3.Identity(1, device=device)
                     if processed_idx == 0
@@ -562,8 +576,14 @@ if __name__ == "__main__":
                 if mode == Mode.INIT:
                     X_init, C_init = mast3r_inference_mono(model, frame)
                     frame.update_pointmap(X_init, C_init)
-                    keyframes.append(frame)
-                    states.queue_global_optimization(len(keyframes) - 1)
+                    if len(keyframes) >= max_keyframes:
+                        if not keyframe_limit_warned:
+                            print(f"[Keyframe] Limit {max_keyframes} reached; skipping new keyframes.")
+                            keyframe_limit_warned = True
+                    else:
+                        keyframes.append(frame)
+                        if (len(keyframes) - 1) % global_opt_stride == 0:
+                            states.queue_global_optimization(len(keyframes) - 1)
                     states.set_mode(Mode.TRACKING)
                     states.set_frame(frame)
                     processed_idx += 1
@@ -606,36 +626,43 @@ if __name__ == "__main__":
                     raise Exception("Invalid mode")
 
                 if add_new_kf:
-                    keyframes.append(frame)
-                    if save_camera_results and keyframe_save_dir is not None:
-                        elapsed = time.time() - camera_start_time
-                        img_np = (frame_np * 255.0).clip(0, 255).astype(
-                            np.uint8
-                        )
-                        img_np = cv2.resize(img_np, (512, 512), interpolation=cv2.INTER_AREA)
-                        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-                        img_path = keyframe_save_dir / f"{frame.frame_id:06d}.png"
-                        cv2.imwrite(str(img_path), img_bgr)
-                        yaw_rad = yaw_from_sim3(frame.T_WC)
-                        yaw_deg = math.degrees(yaw_rad)
-                        pose_se3 = as_SE3(frame.T_WC)
-                        pose_mat = pose_se3.matrix()
-                        if pose_mat.ndim == 3:
-                            pose_mat = pose_mat[0]
-                        pose_mat = pose_mat.detach().cpu()
-                        x = float(pose_mat[0, 3])
-                        y = float(pose_mat[1, 3])
-                        if pose_log_file is not None:
-                            pose_log_file.write(
-                                f"{frame.frame_id},{elapsed:.4f},{x:.6f},{y:.6f},{yaw_deg:.3f}\n"
+                    if len(keyframes) >= max_keyframes:
+                        if not keyframe_limit_warned:
+                            print(f"[Keyframe] Limit {max_keyframes} reached; skipping new keyframes.")
+                            keyframe_limit_warned = True
+                        add_new_kf = False
+                    else:
+                        keyframes.append(frame)
+                        if save_camera_results and keyframe_save_dir is not None:
+                            elapsed = time.time() - camera_start_time
+                            img_np = (frame_np * 255.0).clip(0, 255).astype(
+                                np.uint8
                             )
-                            pose_log_file.flush()
-                    states.queue_global_optimization(len(keyframes) - 1)
-                    while config["single_thread"]:
-                        with states.lock:
-                            if len(states.global_optimizer_tasks) == 0:
-                                break
-                        time.sleep(0.01)
+                            img_np = cv2.resize(img_np, (512, 512), interpolation=cv2.INTER_AREA)
+                            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                            img_path = keyframe_save_dir / f"{frame.frame_id:06d}.png"
+                            cv2.imwrite(str(img_path), img_bgr)
+                            yaw_rad = yaw_from_sim3(frame.T_WC)
+                            yaw_deg = math.degrees(yaw_rad)
+                            pose_se3 = as_SE3(frame.T_WC)
+                            pose_mat = pose_se3.matrix()
+                            if pose_mat.ndim == 3:
+                                pose_mat = pose_mat[0]
+                            pose_mat = pose_mat.detach().cpu()
+                            x = float(pose_mat[0, 3])
+                            y = float(pose_mat[1, 3])
+                            if pose_log_file is not None:
+                                pose_log_file.write(
+                                    f"{frame.frame_id},{elapsed:.4f},{x:.6f},{y:.6f},{yaw_deg:.3f}\n"
+                                )
+                                pose_log_file.flush()
+                        if (len(keyframes) - 1) % global_opt_stride == 0:
+                            states.queue_global_optimization(len(keyframes) - 1)
+                            while config["single_thread"]:
+                                with states.lock:
+                                    if len(states.global_optimizer_tasks) == 0:
+                                        break
+                                time.sleep(0.01)
 
                 if processed_idx % 30 == 0 and processed_idx > 0:
                     fps = processed_idx / (time.time() - fps_timer)
@@ -675,7 +702,7 @@ if __name__ == "__main__":
         imu_stop = mp.Event()
         imu_process = mp.Process(
             target=imu_reader_process,
-            args=(args.imu_dev, args.imu_baud, states, imu_stop),
+            args=(args.imu_dev, args.imu_baud, states, imu_stop, imu_yaw_sign),
             daemon=True,
         )
         imu_process.start()
@@ -683,6 +710,8 @@ if __name__ == "__main__":
     i = 0
     fps_timer = time.time()
     frames = []
+    max_keyframes = keyframes.buffer
+    keyframe_limit_warned = False
 
     try:
         while True:
@@ -728,8 +757,14 @@ if __name__ == "__main__":
             if mode == Mode.INIT:
                 X_init, C_init = mast3r_inference_mono(model, frame)
                 frame.update_pointmap(X_init, C_init)
-                keyframes.append(frame)
-                states.queue_global_optimization(len(keyframes) - 1)
+                if len(keyframes) >= max_keyframes:
+                    if not keyframe_limit_warned:
+                        print(f"[Keyframe] Limit {max_keyframes} reached; skipping new keyframes.")
+                        keyframe_limit_warned = True
+                else:
+                    keyframes.append(frame)
+                    if (len(keyframes) - 1) % global_opt_stride == 0:
+                        states.queue_global_optimization(len(keyframes) - 1)
                 states.set_mode(Mode.TRACKING)
                 states.set_frame(frame)
                 i += 1
@@ -772,13 +807,19 @@ if __name__ == "__main__":
                 raise Exception("Invalid mode")
 
             if add_new_kf:
-                keyframes.append(frame)
-                states.queue_global_optimization(len(keyframes) - 1)
-                while config["single_thread"]:
-                    with states.lock:
-                        if len(states.global_optimizer_tasks) == 0:
-                            break
-                    time.sleep(0.01)
+                if len(keyframes) >= max_keyframes:
+                    if not keyframe_limit_warned:
+                        print(f"[Keyframe] Limit {max_keyframes} reached; skipping new keyframes.")
+                        keyframe_limit_warned = True
+                else:
+                    keyframes.append(frame)
+                    if (len(keyframes) - 1) % global_opt_stride == 0:
+                        states.queue_global_optimization(len(keyframes) - 1)
+                        while config["single_thread"]:
+                            with states.lock:
+                                if len(states.global_optimizer_tasks) == 0:
+                                    break
+                            time.sleep(0.01)
 
             if i % 30 == 0 and i > 0:
                 FPS = i / (time.time() - fps_timer)
