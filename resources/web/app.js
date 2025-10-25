@@ -127,6 +127,56 @@
     return out;
   }
 
+  const BASIS_SIGNS = [1, -1, -1, 1];
+
+  function cvToGlVec3(vec) {
+    if (!Array.isArray(vec) || vec.length < 3) {
+      return vec;
+    }
+    return [vec[0], -vec[1], -vec[2]];
+  }
+
+  function cvToGlBuffer(buffer) {
+    for (let i = 0; i + 2 < buffer.length; i += 3) {
+      buffer[i + 1] = -buffer[i + 1];
+      buffer[i + 2] = -buffer[i + 2];
+    }
+    return buffer;
+  }
+
+  function cvToGlPose(pose) {
+    if (!Array.isArray(pose) || pose.length === 0) {
+      return pose;
+    }
+    const rows = Math.min(4, pose.length);
+    const cols = Math.min(4, Array.isArray(pose[0]) ? pose[0].length : 0);
+    if (cols === 0) {
+      return pose;
+    }
+    const result = new Array(4);
+    for (let i = 0; i < 4; i += 1) {
+      result[i] = new Array(4);
+      for (let j = 0; j < 4; j += 1) {
+        if (i < rows && j < cols) {
+          const baseRow = pose[i];
+          const value = Array.isArray(baseRow) ? baseRow[j] : undefined;
+          if (typeof value === 'number') {
+            const signI = BASIS_SIGNS[i] ?? 1;
+            const signJ = BASIS_SIGNS[j] ?? 1;
+            result[i][j] = value * signI * signJ;
+          } else {
+            result[i][j] = j === i ? 1 : 0;
+          }
+        } else if (i === j) {
+          result[i][j] = 1;
+        } else {
+          result[i][j] = 0;
+        }
+      }
+    }
+    return result;
+  }
+
   function mat3InvertTranspose(out, m) {
     const a00 = m[0];
     const a01 = m[1];
@@ -160,14 +210,6 @@
 
     return out;
   }
-
-  function flipZ(buffer, stride = 3) {
-    for (let i = stride - 1; i < buffer.length; i += stride) {
-      buffer[i] = -buffer[i];
-    }
-    return buffer;
-  }
-
 
   // ---------------------------------------------------------------------------
   // Shader compilation helpers
@@ -386,8 +428,8 @@
       bindEmpty();
       return;
     }
-    const pose = cameraPose;
-    if (!Array.isArray(pose[0]) || pose[0].length < 3) {
+    const pose = cvToGlPose(cameraPose);
+    if (!Array.isArray(pose) || pose.length < 3 || !Array.isArray(pose[0]) || pose[0].length < 3) {
       bindEmpty();
       return;
     }
@@ -416,7 +458,6 @@
         origin[0], origin[1], origin[2],
         end[0], end[1], end[2],
       ]);
-      flipZ(data);
       gl.bindBuffer(gl.ARRAY_BUFFER, currentAxisVAOs[key].buffer);
       gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
       currentAxisCounts[key] = data.length / 3;
@@ -430,11 +471,9 @@
       updateCurrentAxes(scene ? scene.cameraPose : null);
       return;
     }
-    const positions = new Float32Array(scene.points);
-    const normals = new Float32Array(scene.normals);
+    const positions = cvToGlBuffer(new Float32Array(scene.points));
+    const normals = cvToGlBuffer(new Float32Array(scene.normals));
     const colors = new Float32Array(scene.colors);
-    flipZ(positions);
-    flipZ(normals);
     surfelCount = positions.length / 3;
 
     gl.bindBuffer(gl.ARRAY_BUFFER, surfelVAO.positionBuffer);
@@ -471,13 +510,14 @@
 
     for (let i = 0; i < count; i += 1) {
       const base = i * 3;
-      const pos = entries[i].position || [0, 0, 0];
+      const pos = cvToGlVec3(entries[i].position || [0, 0, 0]);
       positions[base + 0] = pos[0];
       positions[base + 1] = pos[1];
       positions[base + 2] = pos[2];
-      normals[base + 0] = 0;
-      normals[base + 1] = 1;
-      normals[base + 2] = 0;
+      const normal = [0, 1, 0];
+      normals[base + 0] = normal[0];
+      normals[base + 1] = normal[1];
+      normals[base + 2] = normal[2];
       if (i === count - 1) {
         colors[base + 0] = 1.0;
         colors[base + 1] = 0.4;
@@ -488,7 +528,7 @@
         colors[base + 2] = 1.0;
       }
 
-      const pose = entries[i].pose;
+      const pose = cvToGlPose(entries[i].pose);
       if (pose && Array.isArray(pose) && pose.length >= 3 && Array.isArray(pose[0]) && pose[0].length >= 3) {
         const origin = [pose[0][3] || 0, pose[1][3] || 0, pose[2][3] || 0];
         const axes = [
@@ -514,9 +554,6 @@
       }
     }
 
-    flipZ(positions);
-    flipZ(normals);
-
     gl.bindBuffer(gl.ARRAY_BUFFER, keyframeVAO.positionBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, keyframeVAO.normalBuffer);
@@ -527,7 +564,6 @@
 
     axisKeys.forEach((key) => {
       const data = new Float32Array(axisData[key]);
-      flipZ(data);
       gl.bindBuffer(gl.ARRAY_BUFFER, keyframeAxisVAOs[key].buffer);
       gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
       keyframeAxisCounts[key] = data.length / 3;
@@ -536,13 +572,12 @@
     if (count >= 2) {
       const trajPositions = new Float32Array((count - 1) * 6);
       for (let i = 0; i < count - 1; i += 1) {
-        const a = entries[i].position || [0, 0, 0];
-        const b = entries[i + 1].position || [0, 0, 0];
+        const a = cvToGlVec3(entries[i].position || [0, 0, 0]);
+        const b = cvToGlVec3(entries[i + 1].position || [0, 0, 0]);
         const base = i * 6;
         trajPositions.set(a, base);
         trajPositions.set(b, base + 3);
       }
-      flipZ(trajPositions);
       gl.bindBuffer(gl.ARRAY_BUFFER, trajectoryVAO.buffer);
       gl.bufferData(gl.ARRAY_BUFFER, trajPositions, gl.DYNAMIC_DRAW);
       trajectoryVertexCount = trajPositions.length / 3;
@@ -560,10 +595,11 @@
     for (let i = 0; i < edges.length; i += 1) {
       const base = i * 6;
       const segment = edges[i].points || [[0, 0, 0], [0, 0, 0]];
-      positions.set(segment[0], base);
-      positions.set(segment[1], base + 3);
+      const a = cvToGlVec3(segment[0] || [0, 0, 0]);
+      const b = cvToGlVec3(segment[1] || [0, 0, 0]);
+      positions.set(a, base);
+      positions.set(b, base + 3);
     }
-    flipZ(positions);
     gl.bindBuffer(gl.ARRAY_BUFFER, edgeVAO.buffer);
     gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
     edgeVertexCount = positions.length / 3;
@@ -614,10 +650,11 @@
     if (state.currentFrame) {
       frameInfoEl.textContent = `Frame ${state.currentFrame.id} • Surfel points: ${state.currentFrame.pointCount}`;
       imageEl.src = state.currentFrame.image;
-      const pos = state.currentFrame.position || [0, 0, 0];
+      const posCv = state.currentFrame.position || [0, 0, 0];
+      const pos = cvToGlVec3(posCv);
       desiredTarget[0] = pos[0];
       desiredTarget[1] = pos[1];
-      desiredTarget[2] = -pos[2];
+      desiredTarget[2] = pos[2];
     }
 
     updateSurfels(state.scene);

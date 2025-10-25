@@ -247,6 +247,7 @@ class WebVisualizationProvider:
 
         y_max = h - 1
         x_max = w - 1
+
         for y in range(1, y_max, stride):
             for x in range(1, x_max, stride):
                 if C[y, x] < conf_threshold:
