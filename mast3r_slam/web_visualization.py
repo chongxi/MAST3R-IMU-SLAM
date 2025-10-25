@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -96,6 +97,30 @@ class WebVisualizationProvider:
                 conf_threshold=self.conf_threshold,
             )
 
+            yaw_raw, yaw_timestamp = self.states.get_imu_yaw()
+            yaw_corrected = None
+            if yaw_raw is not None:
+                yaw_corrected, _ = self.states.get_imu_yaw(corrected=True)
+            calibrated = self.states.is_imu_yaw_calibrated()
+            heading_angle = yaw_corrected if yaw_corrected is not None else yaw_raw
+            heading_vector = None
+            if heading_angle is not None:
+                heading_vector = [
+                    math.sin(heading_angle),
+                    0.0,
+                    math.cos(heading_angle),
+                ]
+            imu_payload = {
+                "available": yaw_raw is not None,
+                "calibrated": bool(calibrated),
+                "rawYawRad": yaw_raw,
+                "rawYawDeg": math.degrees(yaw_raw) if yaw_raw is not None else None,
+                "correctedYawRad": yaw_corrected,
+                "correctedYawDeg": math.degrees(yaw_corrected) if yaw_corrected is not None else None,
+                "timestamp": yaw_timestamp,
+                "headingVector": heading_vector,
+            }
+
             aggregated = CachedPointCloud()
             aggregated.extend(current_cloud)
             for entry in keyframe_entries:
@@ -130,6 +155,7 @@ class WebVisualizationProvider:
                     for entry in keyframe_entries
                 ],
                 "edges": edges,
+                "imu": imu_payload,
             }
         return payload
 
@@ -335,7 +361,7 @@ def run_web_visualization(
     main2viz,
     viz2main,
     *,
-    host: str = "127.0.0.1",
+    host: str = "0.0.0.0",
     port: int = 7860,
     conf_threshold: float = 1.5,
     current_stride: int = 4,

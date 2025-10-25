@@ -83,6 +83,17 @@ main {
   line-height: 1.4;
 }
 
+.info-block {
+  font-size: 0.85rem;
+  color: #cdd7df;
+  min-height: 2.25rem;
+  line-height: 1.4;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid #2b3237;
+  border-radius: 4px;
+  background-color: #0e1113;
+}
+
 #right-panel {
   flex: 1 1 auto;
   position: relative;

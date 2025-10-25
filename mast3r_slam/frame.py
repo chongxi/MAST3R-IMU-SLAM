@@ -1,10 +1,15 @@
 import dataclasses
+import math
+import time
 from enum import Enum
 from typing import Optional
 import lietorch
 import torch
 from mast3r_slam.mast3r_utils import resize_img
 from mast3r_slam.config import config
+
+def _wrap_to_pi(angle: float) -> float:
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
 class Mode(Enum):
@@ -150,6 +155,11 @@ class SharedStates:
         self.global_optimizer_tasks = manager.list()
         self.edges_ii = manager.list()
         self.edges_jj = manager.list()
+        self.imu_yaw = manager.Value("d", float('nan'))
+        self.imu_yaw_timestamp = manager.Value("d", float('nan'))
+        self.imu_yaw_bias = manager.Value("d", float('nan'))
+        self.imu_yaw_calib_sum = manager.Value("d", 0.0)
+        self.imu_yaw_calib_count = manager.Value("i", 0)
 
         self.feat_dim = 1024
         self.num_patches = h * w // (16 * 16)
@@ -218,6 +228,49 @@ class SharedStates:
     def set_mode(self, mode):
         with self.lock:
             self.mode.value = mode
+
+    def set_imu_yaw(self, yaw_rad: float, timestamp: float | None = None):
+        wrapped = _wrap_to_pi(yaw_rad)
+        with self.lock:
+            self.imu_yaw.value = wrapped
+            self.imu_yaw_timestamp.value = time.time() if timestamp is None else timestamp
+
+    def get_imu_yaw(self, *, corrected: bool = False):
+        with self.lock:
+            yaw = self.imu_yaw.value
+            timestamp = self.imu_yaw_timestamp.value
+            bias = self.imu_yaw_bias.value
+        if math.isnan(yaw):
+            return None, timestamp
+        if corrected and not math.isnan(bias):
+            yaw = _wrap_to_pi(yaw - bias)
+        return yaw, timestamp
+
+    def record_imu_calibration(self, camera_yaw: float, required_samples: int = 15) -> bool:
+        completed = False
+        with self.lock:
+            yaw = self.imu_yaw.value
+            if math.isnan(yaw) or not math.isnan(self.imu_yaw_bias.value):
+                return False
+            diff = _wrap_to_pi(yaw - camera_yaw)
+            self.imu_yaw_calib_sum.value += diff
+            self.imu_yaw_calib_count.value += 1
+            if self.imu_yaw_calib_count.value >= required_samples:
+                bias = self.imu_yaw_calib_sum.value / max(self.imu_yaw_calib_count.value, 1)
+                self.imu_yaw_bias.value = _wrap_to_pi(bias)
+                completed = True
+        return completed
+
+    def is_imu_yaw_calibrated(self) -> bool:
+        with self.lock:
+            return not math.isnan(self.imu_yaw_bias.value)
+
+    def get_imu_yaw_bias(self):
+        with self.lock:
+            bias = self.imu_yaw_bias.value
+        if math.isnan(bias):
+            return None
+        return bias
 
     def pause(self):
         with self.lock:

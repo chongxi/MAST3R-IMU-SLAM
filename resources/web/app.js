@@ -3,6 +3,7 @@
 
   const statusEl = document.getElementById('status-indicator');
   const frameInfoEl = document.getElementById('frame-info');
+  const imuInfoEl = document.getElementById('imu-info');
   const imageEl = document.getElementById('current-image');
   const confSlider = document.getElementById('conf-threshold');
   const confValueEl = document.getElementById('conf-value');
@@ -317,6 +318,7 @@
   const keyframeVAO = createPointVAO();
   const trajectoryVAO = createLineVAO();
   const edgeVAO = createLineVAO();
+  const imuHeadingVAO = createLineVAO();
   const currentAxisVAOs = {
     x: createLineVAO(),
     y: createLineVAO(),
@@ -332,6 +334,7 @@
   let keyframeCount = 0;
   let trajectoryVertexCount = 0;
   let edgeVertexCount = 0;
+  let imuHeadingCount = 0;
   const currentAxisCounts = { x: 0, y: 0, z: 0 };
   const keyframeAxisCounts = { x: 0, y: 0, z: 0 };
 
@@ -586,6 +589,68 @@
     }
   }
 
+  function updateImuInfo(imu) {
+    if (!imuInfoEl) {
+      return;
+    }
+    if (!imu || !imu.available) {
+      imuInfoEl.textContent = 'IMU not connected';
+      return;
+    }
+    const displayYaw = Number.isFinite(imu.correctedYawDeg) ? imu.correctedYawDeg : imu.rawYawDeg;
+    const label = imu.calibrated ? 'calibrated' : 'raw';
+    if (Number.isFinite(displayYaw)) {
+      imuInfoEl.textContent = `Yaw (${label}): ${displayYaw.toFixed(1)} deg`;
+    } else {
+      imuInfoEl.textContent = `Yaw (${label}): --`;
+    }
+  }
+
+  function updateImuHeading(scene, imu) {
+    const empty = new Float32Array(0);
+    if (!imu || !imu.available || !Array.isArray(imu.headingVector)) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, imuHeadingVAO.buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, empty, gl.DYNAMIC_DRAW);
+      imuHeadingCount = 0;
+      return;
+    }
+
+    let originCv = [0, 0, 0];
+    const pose = scene && Array.isArray(scene.cameraPose) ? scene.cameraPose : null;
+    if (pose && pose.length >= 3 && Array.isArray(pose[0]) && pose[0].length >= 4) {
+      originCv = [pose[0][3], pose[1][3], pose[2][3]];
+    }
+
+    const origin = cvToGlVec3(originCv);
+    const direction = cvToGlVec3(imu.headingVector);
+    if (!Array.isArray(direction) || !direction.every((v) => Number.isFinite(v))) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, imuHeadingVAO.buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, empty, gl.DYNAMIC_DRAW);
+      imuHeadingCount = 0;
+      return;
+    }
+    const magnitude = Math.hypot(direction[0], direction[1], direction[2]);
+    if (magnitude < 1e-6) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, imuHeadingVAO.buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, empty, gl.DYNAMIC_DRAW);
+      imuHeadingCount = 0;
+      return;
+    }
+    const scale = 0.25 / magnitude;
+    const end = [
+      origin[0] + direction[0] * scale,
+      origin[1] + direction[1] * scale,
+      origin[2] + direction[2] * scale,
+    ];
+    const data = new Float32Array([
+      origin[0], origin[1], origin[2],
+      end[0], end[1], end[2],
+    ]);
+    gl.bindBuffer(gl.ARRAY_BUFFER, imuHeadingVAO.buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+    imuHeadingCount = data.length / 3;
+  }
+
   function updateEdges(edges) {
     if (!Array.isArray(edges) || edges.length === 0) {
       edgeVertexCount = 0;
@@ -604,6 +669,7 @@
     gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
     edgeVertexCount = positions.length / 3;
   }
+
 
   // ---------------------------------------------------------------------------
   // Fetch + UI wiring
@@ -660,6 +726,8 @@
     updateSurfels(state.scene);
     updateKeyframes(state.keyframes);
     updateEdges(state.edges);
+    updateImuInfo(state.imu);
+    updateImuHeading(state.scene, state.imu);
 
     if (typeof state.confThreshold === 'number' && !confSlider.matches(':active')) {
       confSlider.value = state.confThreshold.toFixed(1);
@@ -761,6 +829,12 @@
         gl.drawArrays(gl.LINES, 0, keyframeAxisCounts[key]);
       }
     });
+
+    if (imuHeadingCount > 0) {
+      gl.uniform3f(lineUniforms.color, 1.0, 0.85, 0.2);
+      gl.bindVertexArray(imuHeadingVAO.vao);
+      gl.drawArrays(gl.LINES, 0, imuHeadingCount);
+    }
 
     if (performance.now() - lastFetchTime > 5000) {
       statusEl.textContent = 'Waiting for data…';

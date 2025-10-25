@@ -417,3 +417,10 @@ def resize_img(img, size, square_ok=False, return_transformation=False):
         return res, (scale_w, scale_h, half_crop_w, half_crop_h)
 
     return res
+
+
+def load_and_encode_image(model, frame):
+    feat, pos, _ = model._encode_image(frame.img, frame.img_true_shape)
+    frame.feat = feat
+    frame.pos = pos
+    return frame
